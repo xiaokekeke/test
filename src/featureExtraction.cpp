@@ -1,33 +1,11 @@
-/************************************************* 
-GitHub: https://github.com/smilefacehh/LIO-SAM-DetailedNote
-Author: lutao2014@163.com
-Date: 2021-02-21 
---------------------------------------------------
-功能简介:
-    对经过运动畸变校正之后的当前帧激光点云，计算每个点的曲率，进而提取角点、平面点（用曲率的大小进行判定）。
-
-订阅：
-    1、订阅当前激光帧运动畸变校正后的点云信息，来自ImageProjection。
-
-发布：
-    1、发布当前激光帧提取特征之后的点云信息，包括的历史数据有：运动畸变校正，点云数据，初始位姿，姿态角，有效点云数据，角点点云，平面点点云等，发布给MapOptimization；
-    2、发布当前激光帧提取的角点点云，用于rviz展示；
-    3、发布当前激光帧提取的平面点点云，用于rviz展示。
-**************************************************/  
-#include "utility.h"
-#include "lio_sam/cloud_info.h"
-
-/**
- * 激光点曲率
-*/
+#include "../include/utility.h"
+#include "slio_sam/cloud_info.h"
+#define PROCESS 0
 struct smoothness_t{ 
-    float value; // 曲率值
-    size_t ind;  // 激光点一维索引
+    float value;
+    size_t ind;
 };
 
-/**
- * 曲率比较函数，从小到大排序
-*/
 struct by_value{ 
     bool operator()(smoothness_t const &left, smoothness_t const &right) { 
         return left.value < right.value;
@@ -41,59 +19,42 @@ public:
 
     ros::Subscriber subLaserCloudInfo;
 
-    // 发布当前激光帧提取特征之后的点云信息
     ros::Publisher pubLaserCloudInfo;
-    // 发布当前激光帧提取的角点点云
     ros::Publisher pubCornerPoints;
-    // 发布当前激光帧提取的平面点点云
     ros::Publisher pubSurfacePoints;
 
-    // 当前激光帧运动畸变校正后的有效点云
     pcl::PointCloud<PointType>::Ptr extractedCloud;
-    // 当前激光帧角点点云集合
     pcl::PointCloud<PointType>::Ptr cornerCloud;
-    // 当前激光帧平面点点云集合
     pcl::PointCloud<PointType>::Ptr surfaceCloud;
 
     pcl::VoxelGrid<PointType> downSizeFilter;
 
-    // 当前激光帧点云信息，包括的历史数据有：运动畸变校正，点云数据，初始位姿，姿态角，有效点云数据，角点点云，平面点点云等
-    lio_sam::cloud_info cloudInfo;
+    slio_sam::cloud_info cloudInfo;
     std_msgs::Header cloudHeader;
 
-    // 当前激光帧点云的曲率
     std::vector<smoothness_t> cloudSmoothness;
     float *cloudCurvature;
-    // 特征提取标记，1表示遮挡、平行，或者已经进行特征提取的点，0表示还未进行特征提取处理
     int *cloudNeighborPicked;
-    // 1表示角点，-1表示平面点
     int *cloudLabel;
 
-    /**
-     * 构造函数
-    */
     FeatureExtraction()
     {
-        // 订阅当前激光帧运动畸变校正后的点云信息
-        subLaserCloudInfo = nh.subscribe<lio_sam::cloud_info>("lio_sam/deskew/cloud_info", 1, &FeatureExtraction::laserCloudInfoHandler, this, ros::TransportHints().tcpNoDelay());
+        //ROS_INFO("FeatureExtraction:");
+        subLaserCloudInfo = nh.subscribe<slio_sam::cloud_info>("slio_sam/deskew/cloud_info", 1, &FeatureExtraction::laserCloudInfoHandler, this, ros::TransportHints().tcpNoDelay());
 
-        // 发布当前激光帧提取特征之后的点云信息
-        pubLaserCloudInfo = nh.advertise<lio_sam::cloud_info> ("lio_sam/feature/cloud_info", 1);
-        // 发布当前激光帧的角点点云
-        pubCornerPoints = nh.advertise<sensor_msgs::PointCloud2>("lio_sam/feature/cloud_corner", 1);
-        // 发布当前激光帧的面点点云
-        pubSurfacePoints = nh.advertise<sensor_msgs::PointCloud2>("lio_sam/feature/cloud_surface", 1);
-        
-        // 初始化
+        pubLaserCloudInfo = nh.advertise<slio_sam::cloud_info> ("slio_sam/feature/cloud_info", 1);
+        pubCornerPoints = nh.advertise<sensor_msgs::PointCloud2>("slio_sam/feature/cloud_corner", 1);
+        pubSurfacePoints = nh.advertise<sensor_msgs::PointCloud2>("slio_sam/feature/cloud_surface", 1);
+        //ROS_INFO("initializationValue");
         initializationValue();
     }
 
-    // 初始化
     void initializationValue()
     {
+        //ROS_INFO("initializationValue_start");
         cloudSmoothness.resize(N_SCAN*Horizon_SCAN);
 
-        downSizeFilter.setLeafSize(odometrySurfLeafSize, odometrySurfLeafSize, odometrySurfLeafSize);
+        downSizeFilter.setLeafSize(odometrySurfLeafSize, odometrySurfLeafSize, odometrySurfLeafSize);//降采样大小
 
         extractedCloud.reset(new pcl::PointCloud<PointType>());
         cornerCloud.reset(new pcl::PointCloud<PointType>());
@@ -102,49 +63,35 @@ public:
         cloudCurvature = new float[N_SCAN*Horizon_SCAN];
         cloudNeighborPicked = new int[N_SCAN*Horizon_SCAN];
         cloudLabel = new int[N_SCAN*Horizon_SCAN];
+        //ROS_INFO("initializationValue_end");
     }
 
-    /**
-     * 订阅当前激光帧运动畸变校正后的点云信息
-     * 1、计算当前激光帧点云中每个点的曲率
-     * 2、标记属于遮挡、平行两种情况的点，不做特征提取
-     * 3、点云角点、平面点特征提取
-     *   1) 遍历扫描线，每根扫描线扫描一周的点云划分为6段，针对每段提取20个角点、不限数量的平面点，加入角点集合、平面点集合
-     *   2) 认为非角点的点都是平面点，加入平面点云集合，最后降采样
-     * 4、发布角点、面点点云，发布带特征点云数据的当前激光帧点云信息
-    */
-    void laserCloudInfoHandler(const lio_sam::cloud_infoConstPtr& msgIn)
+    void laserCloudInfoHandler(const slio_sam::cloud_infoConstPtr& msgIn)
     {
-        cloudInfo = *msgIn; 
-        cloudHeader = msgIn->header; 
-        // 当前激光帧运动畸变校正后的有效点云
-        pcl::fromROSMsg(msgIn->cloud_deskewed, *extractedCloud); 
-
-        // 计算当前激光帧点云中每个点的曲率
+        cloudInfo = *msgIn; // new cloud info
+        cloudHeader = msgIn->header; // new cloud header
+        pcl::fromROSMsg(msgIn->cloud_deskewed, *extractedCloud); // 这里相当于单独把它点信息给拿出来了
+        //ROS_INFO("featureExtraction: 去畸变后点数量：%d",extractedCloud->size());
+        //计算曲率
+        //ROS_INFO("计算曲率\n，去畸变后点云数量:%d,扫描点数量:%d",extractedCloud->size(),cloudInfo.pointRange.size());
         calculateSmoothness();
-
-        // 标记属于遮挡、平行两种情况的点，不做特征提取
+        //标记异常点
+        //ROS_INFO("记录异常点");
         markOccludedPoints();
-
-        // 点云角点、平面点特征提取
-        // 1、遍历扫描线，每根扫描线扫描一周的点云划分为6段，针对每段提取20个角点、不限数量的平面点，加入角点集合、平面点集合
-        // 2、认为非角点的点都是平面点，加入平面点云集合，最后降采样
+        //提取特征点并且对线特征降采样，这里线特征可以考虑换一个方式，不要直接进行降采样，
+        //能不能换一个方式降采样，按线分配特征点，有的线长有的线短,让每个线都有均匀分布特征点。
+        //ROS_INFO("提取特征点");
         extractFeatures();
-        
-        // 发布角点、面点点云，发布带特征点云数据的当前激光帧点云信息
+        //ROS_INFO("发布特征点");
         publishFeatureCloud();
+        //ROS_INFO("--------点云预处理-end-------");
     }
 
-    /**
-     * 计算当前激光帧点云中每个点的曲率
-    */
     void calculateSmoothness()
     {
-        // 遍历当前激光帧运动畸变校正后的有效点云
-        int cloudSize = extractedCloud->points.size();
+        int cloudSize = extractedCloud->points.size();//这个是提取后的，其位置和原始的点云位置不一样了,不过couldinfo.pointColInd存储了下标
         for (int i = 5; i < cloudSize - 5; i++)
-        {
-            // 用当前激光点前后5个点计算当前点的曲率，平坦位置处曲率较小，角点处曲率较大；这个方法很简单但有效 pointRange是指该点到lidar坐标系原点的距离
+        {   //cout<<"cInfo.Range"<<i<<":"<<cloudInfo.pointRange[i]<<endl;
             float diffRange = cloudInfo.pointRange[i-5] + cloudInfo.pointRange[i-4]
                             + cloudInfo.pointRange[i-3] + cloudInfo.pointRange[i-2]
                             + cloudInfo.pointRange[i-1] - cloudInfo.pointRange[i] * 10
@@ -152,47 +99,38 @@ public:
                             + cloudInfo.pointRange[i+3] + cloudInfo.pointRange[i+4]
                             + cloudInfo.pointRange[i+5];            
 
-            // 距离差值平方作为曲率
-            cloudCurvature[i] = diffRange*diffRange;
-
+            cloudCurvature[i] = diffRange*diffRange;//diffX * diffX + diffY * diffY + diffZ * diffZ;
+            // cout<<"cloudCurvature"<<i<<":"<<cloudCurvature[i]<<" ";
             cloudNeighborPicked[i] = 0;
             cloudLabel[i] = 0;
-            
-            // 存储该点曲率值、激光点一维索引
+            // cloudSmoothness for sorting
             cloudSmoothness[i].value = cloudCurvature[i];
             cloudSmoothness[i].ind = i;
         }
     }
 
-    /**
-     * 标记属于遮挡、平行两种情况的点，不做特征提取
-    */
     void markOccludedPoints()
     {
         int cloudSize = extractedCloud->points.size();
         // mark occluded points and parallel beam points
-
         for (int i = 5; i < cloudSize - 6; ++i)
         {
-            // 当前点和下一个点的range值
+            // occluded points
             float depth1 = cloudInfo.pointRange[i];
             float depth2 = cloudInfo.pointRange[i+1];
-            // 两个激光点之间的一维索引差值，如果在一条扫描线上，那么值为1；如果两个点之间有一些无效点被剔除了，可能会比1大，但不会特别大
-            // 如果恰好前一个点在扫描一周的结束时刻，下一个点是另一条扫描线的起始时刻，那么值会很大
+            //获取有效点之间的下标间隔，理论上应该是１，但是因为一些无效点的存在结果会大于１
             int columnDiff = std::abs(int(cloudInfo.pointColInd[i+1] - cloudInfo.pointColInd[i]));
-
-            // 两个点在同一扫描线上，且距离相差大于0.3，认为存在遮挡关系（也就是这两个点不在同一平面上，如果在同一平面上，距离相差不会太大）
-            // 远处的点会被遮挡，标记一下该点以及相邻的5个点，后面不再进行特征提取
+              //如果中间间隔不是很大，这里主要是预防两个有效点之间无效点过多。
             if (columnDiff < 10){
-                
-                if (depth1 - depth2 > 0.3){
+                //相邻的两帧间隔深度差大于0.3说明遇到遮挡点了，标记为已经选择过，下次就不会再对这些点进行特征点提取了。
+                if (depth1 - depth2 > 0.05){//０.3 这些参数都是经过计算得到的，自己也要好好算算，这个是不是有点大了应该改成0.1
                     cloudNeighborPicked[i - 5] = 1;
                     cloudNeighborPicked[i - 4] = 1;
                     cloudNeighborPicked[i - 3] = 1;
                     cloudNeighborPicked[i - 2] = 1;
                     cloudNeighborPicked[i - 1] = 1;
                     cloudNeighborPicked[i] = 1;
-                }else if (depth2 - depth1 > 0.3){
+                }else if (depth2 - depth1 > 0.05){
                     cloudNeighborPicked[i + 1] = 1;
                     cloudNeighborPicked[i + 2] = 1;
                     cloudNeighborPicked[i + 3] = 1;
@@ -201,22 +139,15 @@ public:
                     cloudNeighborPicked[i + 6] = 1;
                 }
             }
-            
-            // 用前后相邻点判断当前点所在平面是否与激光束方向平行
+            // 获取当前点相邻之间的深度差
             float diff1 = std::abs(float(cloudInfo.pointRange[i-1] - cloudInfo.pointRange[i]));
             float diff2 = std::abs(float(cloudInfo.pointRange[i+1] - cloudInfo.pointRange[i]));
-
-            // 平行则标记一下
+            //如果相邻深度都较大，则认为当前点为平行光束，并标记为已经选择过
             if (diff1 > 0.02 * cloudInfo.pointRange[i] && diff2 > 0.02 * cloudInfo.pointRange[i])
                 cloudNeighborPicked[i] = 1;
         }
     }
 
-    /**
-     * 点云角点、平面点特征提取
-     * 1、遍历扫描线，每根扫描线扫描一周的点云划分为6段，针对每段提取20个角点、不限数量的平面点，加入角点集合、平面点集合
-     * 2、认为非角点的点都是平面点，加入平面点云集合，最后降采样
-    */
     void extractFeatures()
     {
         cornerCloud->clear();
@@ -225,56 +156,46 @@ public:
         pcl::PointCloud<PointType>::Ptr surfaceCloudScan(new pcl::PointCloud<PointType>());
         pcl::PointCloud<PointType>::Ptr surfaceCloudScanDS(new pcl::PointCloud<PointType>());
 
-        // 遍历扫描线
         for (int i = 0; i < N_SCAN; i++)
         {
             surfaceCloudScan->clear();
 
-            // 将一条扫描线扫描一周的点云数据，划分为6段，每段分开提取有限数量的特征，保证特征均匀分布
             for (int j = 0; j < 6; j++)
             {
-                // 每段点云的起始、结束索引；startRingIndex为扫描线起始第5个激光点在一维数组中的索引
+
                 int sp = (cloudInfo.startRingIndex[i] * (6 - j) + cloudInfo.endRingIndex[i] * j) / 6;
                 int ep = (cloudInfo.startRingIndex[i] * (5 - j) + cloudInfo.endRingIndex[i] * (j + 1)) / 6 - 1;
 
                 if (sp >= ep)
                     continue;
 
-                // 按照曲率从小到大排序点云
                 std::sort(cloudSmoothness.begin()+sp, cloudSmoothness.begin()+ep, by_value());
 
-                // 按照曲率从大到小遍历  角点
                 int largestPickedNum = 0;
                 for (int k = ep; k >= sp; k--)
                 {
-                    // 激光点的索引
                     int ind = cloudSmoothness[k].ind;
-                    // 当前激光点还未被处理，且曲率大于阈值，则认为是角点
+                    // edgeThreshold为0.1，正圆的曲率为0
                     if (cloudNeighborPicked[ind] == 0 && cloudCurvature[ind] > edgeThreshold)
                     {
-                        // 每段只取20个角点，如果单条扫描线扫描一周是1800个点，则划分6段，每段300个点，从中提取20个角点
                         largestPickedNum++;
                         if (largestPickedNum <= 20){
-                            // 标记为角点
-                            cloudLabel[ind] = 1;
-                            // 加入角点点云
+                            cloudLabel[ind] = 1;//标记点的类型，如果判断是角点，就会被标记为１
                             cornerCloud->push_back(extractedCloud->points[ind]);
                         } else {
                             break;
                         }
-
-                        // 标记已被处理
+                        // 防止特征点聚集，将ind及其前后各5个点标记，不做特征点提取
                         cloudNeighborPicked[ind] = 1;
-                        // 同一条扫描线上后5个点标记一下，不再处理，避免特征聚集
-                        for (int l = 1; l <= 5; l++)
-                        {
+                        for (int l = 1; l <= mask; l++)
+                        {   // 每个点index之间的差值。附近点都是有效点的情况下，相邻点间的索引只差１
                             int columnDiff = std::abs(int(cloudInfo.pointColInd[ind + l] - cloudInfo.pointColInd[ind + l - 1]));
-                            if (columnDiff > 10)
+                            // 附近有无效点，或者是每条线的起点和终点的部分
+                            if (columnDiff > 10)//这个是用来
                                 break;
                             cloudNeighborPicked[ind + l] = 1;
                         }
-                        // 同一条扫描线上前5个点标记一下，不再处理，避免特征聚集
-                        for (int l = -1; l >= -5; l--)
+                        for (int l = -1; l >= -mask; l--)
                         {
                             int columnDiff = std::abs(int(cloudInfo.pointColInd[ind + l] - cloudInfo.pointColInd[ind + l + 1]));
                             if (columnDiff > 10)
@@ -284,41 +205,31 @@ public:
                     }
                 }
 
-                // 按照曲率从小到大遍历  面点处理
                 for (int k = sp; k <= ep; k++)
                 {
-                    // 激光点的索引
                     int ind = cloudSmoothness[k].ind;
-                    // 当前激光点还未被处理，且曲率小于阈值，则认为是平面点
-                    if (cloudNeighborPicked[ind] == 0 && cloudCurvature[ind] < surfThreshold)
+                    //surfThreshold=0.1
+                    if (cloudNeighborPicked[ind] == 0 && cloudCurvature[ind] < 0)//edgeThreshold 修改为0
                     {
-                        // 标记为平面点
+                        //特征点点标记，如果是面点，就会给标记为-1,标记完成后，表示特征点不在提取
                         cloudLabel[ind] = -1;
-                        // 标记已被处理
                         cloudNeighborPicked[ind] = 1;
-
-                        // 同一条扫描线上后5个点标记一下，不再处理，避免特征聚集
-                        for (int l = 1; l <= 5; l++) {
-
+                        //同样的为防止特征点聚集，将ind及其前后各5个点标记，不做特征点提取
+                        for (int l = 1; l <= mask; l++) {
                             int columnDiff = std::abs(int(cloudInfo.pointColInd[ind + l] - cloudInfo.pointColInd[ind + l - 1]));
                             if (columnDiff > 10)
                                 break;
-
                             cloudNeighborPicked[ind + l] = 1;
                         }
-                        // 同一条扫描线上前5个点标记一下，不再处理，避免特征聚集
-                        for (int l = -1; l >= -5; l--) {
-
+                        for (int l = -1; l >= -mask; l--) {
                             int columnDiff = std::abs(int(cloudInfo.pointColInd[ind + l] - cloudInfo.pointColInd[ind + l + 1]));
                             if (columnDiff > 10)
                                 break;
-
                             cloudNeighborPicked[ind + l] = 1;
                         }
                     }
                 }
-
-                // 平面点和未被处理的点，都认为是平面点，加入平面点云集合
+                //根据标记获取平面点
                 for (int k = sp; k <= ep; k++)
                 {
                     if (cloudLabel[k] <= 0){
@@ -326,20 +237,15 @@ public:
                     }
                 }
             }
-
-            // 平面点云降采样
+           
             surfaceCloudScanDS->clear();
-            downSizeFilter.setInputCloud(surfaceCloudScan);
+            downSizeFilter.setInputCloud(surfaceCloudScan);//20cm,面特征降采样
             downSizeFilter.filter(*surfaceCloudScanDS);
-
-            // 加入平面点云集合
             *surfaceCloud += *surfaceCloudScanDS;
         }
+        //ROS_INFO("featureExtration 角特征点数量%d,平面特征点数量%d",cornerCloud->size(),surfaceCloud->size());
     }
 
-    /**
-     * 清理
-    */
     void freeCloudInfoMemory()
     {
         cloudInfo.startRingIndex.clear();
@@ -348,17 +254,16 @@ public:
         cloudInfo.pointRange.clear();
     }
 
-    /**
-     * 发布角点、面点点云，发布带特征点云数据的当前激光帧点云信息
-    */
     void publishFeatureCloud()
     {
-        // 清理
+        // free cloud info memory
         freeCloudInfoMemory();
-        // 发布角点、面点点云，用于rviz展示
-        cloudInfo.cloud_corner  = publishCloud(&pubCornerPoints,  cornerCloud,  cloudHeader.stamp, lidarFrame);
-        cloudInfo.cloud_surface = publishCloud(&pubSurfacePoints, surfaceCloud, cloudHeader.stamp, lidarFrame);
-        // 发布当前激光帧点云信息，加入了角点、面点点云数据，发布给mapOptimization
+        // save newly extracted features
+        //注对于单线激光雷达来说，线特征就是点特征，面特征就是线特征。
+        //ROS_INFO("publishFeatureCloud 角特征点数量:%d,面特征点数量:%d",cornerCloud->size(),surfaceCloud->size());
+        cloudInfo.cloud_corner  = publishCloud(pubCornerPoints,  cornerCloud,  cloudHeader.stamp, lidarFrame);
+        cloudInfo.cloud_surface = publishCloud(pubSurfacePoints, surfaceCloud, cloudHeader.stamp, lidarFrame);
+        // publish to mapOptimization
         pubLaserCloudInfo.publish(cloudInfo);
     }
 };
@@ -366,12 +271,13 @@ public:
 
 int main(int argc, char** argv)
 {
-    ros::init(argc, argv, "lio_sam");
+    setlocale(LC_CTYPE,"zh_CN.utf8");
+    ros::init(argc, argv, "slio_sam");
 
     FeatureExtraction FE;
 
-    ROS_INFO("\033[1;32m----> Feature Extraction Started.\033[0m");
-   
+    //ROS_INFO("\033[1;32m----> Feature Extraction Started------------.\033[0m");
+    ROS_INFO("\033[1;32m---->启动feature提取.\033[0m");
     ros::spin();
 
     return 0;
