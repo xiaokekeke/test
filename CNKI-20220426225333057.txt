@@ -17,6 +17,5 @@
 %U https://kns.cnki.net/kcms/detail/11.2625.v.20180823.0901.001.html
 %R 10.13700/j.bh.1001-5965.2018.0272
 %W CNKI
-
-
+V1.1.1
 
